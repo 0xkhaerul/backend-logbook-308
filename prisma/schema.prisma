@@ -1,0 +1,32 @@
+// schema.prisma
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL") // Pastikan kamu set DATABASE_URL di .env
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                Int      @id @default(autoincrement())
+  email             String   @unique
+  password          String
+  nama_lengkap      String
+  image_profile_url String?  // Nullable
+  created_at        DateTime @default(now())
+
+  posts             Post[]   // Relasi: satu user bisa memiliki banyak post
+}
+
+model Post {
+  id                Int      @id @default(autoincrement())
+  content           String
+  image_content_url String?  // Nullable
+  created_at        DateTime @default(now())
+  updated_at        DateTime @default(now())
+
+  userId            Int      // Foreign key
+  user              User     @relation(fields: [userId], references: [id]) // Relasi ke User
+}

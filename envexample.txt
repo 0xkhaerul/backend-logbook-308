@@ -1,0 +1,15 @@
+<<<<<<< HEAD
+# Database Configuration
+DATABASE_URL=""
+JWT_SECRET=
+
+# Server Configuration
+PORT=
+=======
+# Database Configuration
+DATABASE_URL=""
+JWT_SECRET=
+
+# Server Configuration
+PORT=
+>>>>>>> caf29ddda08a3dde2a399059bc99880bb0ee15b0
