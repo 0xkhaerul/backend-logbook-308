@@ -21,12 +21,21 @@ model User {
 }
 
 model Post {
-  id                Int      @id @default(autoincrement())
-  content           String
-  image_content_url String?  // Nullable
-  created_at        DateTime @default(now())
-  updated_at        DateTime @default(now())
+  id         Int         @id @default(autoincrement())
+  content    String
+  created_at DateTime    @default(now())
+  updated_at DateTime    @default(now())
 
-  userId            Int      // Foreign key
-  user              User     @relation(fields: [userId], references: [id]) // Relasi ke User
+  userId     Int
+  user       User        @relation(fields: [userId], references: [id])
+
+  images     PostImage[] // Relasi: satu post bisa punya banyak gambar
+}
+
+model PostImage {
+  id           Int    @id @default(autoincrement())
+  imageUrl     String // URL gambar dari cloudinary
+  cloudinaryId String // Public ID dari cloudinary untuk delete
+  postId       Int
+  post         Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
 }

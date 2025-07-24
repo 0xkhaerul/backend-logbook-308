@@ -8,7 +8,7 @@ const getUserIdFromToken = (req) => {
   const authHeader = req.headers["authorization"];
   if (!authHeader) return null;
 
-  const token = authHeader.split(" ")[1]; // Bearer <token>
+  const token = authHeader.split(" ")[1];
   if (!token) return null;
 
   try {
@@ -36,7 +36,8 @@ const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB limit
+    fileSize: 50 * 1024 * 1024, // 50MB limit per file
+    files: 10, // Maximum 10 files
   },
   fileFilter: (req, file, cb) => {
     // Filter untuk file yang diizinkan
@@ -74,7 +75,9 @@ const uploadToCloudinary = (buffer, mimetype, filename) => {
     const uploadOptions = {
       resource_type: resourceType,
       folder: folder,
-      public_id: `${Date.now()}_${filename.split(".")[0]}`,
+      public_id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}_${
+        filename.split(".")[0]
+      }`,
       allowed_formats: [
         "jpg",
         "jpeg",
@@ -99,8 +102,24 @@ const uploadToCloudinary = (buffer, mimetype, filename) => {
   });
 };
 
-// Create Post
+// Helper function untuk upload multiple files
+const uploadMultipleFiles = async (files) => {
+  const uploadPromises = files.map((file) =>
+    uploadToCloudinary(file.buffer, file.mimetype, file.originalname)
+  );
+
+  try {
+    const results = await Promise.all(uploadPromises);
+    return results;
+  } catch (error) {
+    throw error;
+  }
+};
+
+// Create Post dengan Multiple Images
 const createPost = async (req, res) => {
+  let uploadedFiles = [];
+
   try {
     const { content } = req.body;
     const userId = getUserIdFromToken(req);
@@ -125,45 +144,58 @@ const createPost = async (req, res) => {
       });
     }
 
-    let imageContentUrl = null;
-    let uploadResult = null;
-
-    // Jika ada file yang diupload
-    if (req.file) {
+    // Upload files jika ada
+    if (req.files && req.files.length > 0) {
       try {
-        uploadResult = await uploadToCloudinary(
-          req.file.buffer,
-          req.file.mimetype,
-          req.file.originalname
-        );
-        imageContentUrl = uploadResult.secure_url;
+        uploadedFiles = await uploadMultipleFiles(req.files);
       } catch (uploadError) {
         console.error("Error uploading to cloudinary:", uploadError);
         return res.status(500).json({
           success: false,
-          message: "Failed to upload file to cloudinary",
+          message: "Failed to upload files to cloudinary",
           error: uploadError.message,
         });
       }
     }
 
-    // Simpan post ke database
-    const newPost = await prisma.post.create({
-      data: {
-        content,
-        image_content_url: imageContentUrl,
-        userId: parseInt(userId),
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            nama_lengkap: true,
-            email: true,
-            image_profile_url: true,
-          },
+    // Simpan post ke database dengan transaction
+    const newPost = await prisma.$transaction(async (tx) => {
+      // Buat post
+      const post = await tx.post.create({
+        data: {
+          content,
+          userId: parseInt(userId),
         },
-      },
+      });
+
+      // Buat PostImage records jika ada file yang diupload
+      if (uploadedFiles.length > 0) {
+        const imageData = uploadedFiles.map((file) => ({
+          imageUrl: file.secure_url,
+          cloudinaryId: file.public_id, // Tambahkan cloudinary public_id
+          postId: post.id,
+        }));
+
+        await tx.postImage.createMany({
+          data: imageData,
+        });
+      }
+
+      // Return post dengan relasi
+      return await tx.post.findUnique({
+        where: { id: post.id },
+        include: {
+          user: {
+            select: {
+              id: true,
+              nama_lengkap: true,
+              email: true,
+              image_profile_url: true,
+            },
+          },
+          images: true,
+        },
+      });
     });
 
     res.status(201).json({
@@ -174,13 +206,16 @@ const createPost = async (req, res) => {
   } catch (error) {
     console.error("Error creating post:", error);
 
-    // Hapus file dari cloudinary jika ada error database
-    if (uploadResult && uploadResult.public_id) {
-      try {
-        await cloudinary.uploader.destroy(uploadResult.public_id);
-      } catch (deleteError) {
-        console.error("Error deleting file from cloudinary:", deleteError);
-      }
+    // Hapus files dari cloudinary jika ada error database
+    if (uploadedFiles.length > 0) {
+      const deletePromises = uploadedFiles.map((file) =>
+        cloudinary.uploader
+          .destroy(file.public_id)
+          .catch((err) =>
+            console.error("Error deleting file from cloudinary:", err)
+          )
+      );
+      await Promise.allSettled(deletePromises);
     }
 
     res.status(500).json({
@@ -212,6 +247,7 @@ const getAllPosts = async (req, res) => {
             image_profile_url: true,
           },
         },
+        images: true, // Include images
       },
     });
 
@@ -241,7 +277,7 @@ const getAllPosts = async (req, res) => {
   }
 };
 
-// Get Post by ID
+// Get Post By ID
 const getPostById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -257,6 +293,7 @@ const getPostById = async (req, res) => {
             image_profile_url: true,
           },
         },
+        images: true,
       },
     });
 
@@ -282,102 +319,6 @@ const getPostById = async (req, res) => {
   }
 };
 
-// Update Post
-const updatePost = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { content } = req.body;
-    const userId = getUserIdFromToken(req);
-
-    // Validasi post exists
-    const existingPost = await prisma.post.findUnique({
-      where: { id: parseInt(id) },
-    });
-
-    if (!existingPost) {
-      return res.status(404).json({
-        success: false,
-        message: "Post not found",
-      });
-    }
-
-    // Validasi ownership
-    if (!userId || existingPost.userId !== parseInt(userId)) {
-      return res.status(403).json({
-        success: false,
-        message: "You can only update your own posts",
-      });
-    }
-
-    let updateData = {
-      updated_at: new Date(),
-    };
-
-    if (content) {
-      updateData.content = content;
-    }
-
-    // Jika ada file baru diupload
-    if (req.file) {
-      try {
-        // Upload file baru ke cloudinary
-        const uploadResult = await uploadToCloudinary(
-          req.file.buffer,
-          req.file.mimetype,
-          req.file.originalname
-        );
-
-        // Hapus file lama dari cloudinary jika ada
-        if (existingPost.image_content_url) {
-          try {
-            const publicId = extractPublicId(existingPost.image_content_url);
-            await cloudinary.uploader.destroy(publicId);
-          } catch (deleteError) {
-            console.error("Error deleting old file:", deleteError);
-          }
-        }
-
-        updateData.image_content_url = uploadResult.secure_url;
-      } catch (uploadError) {
-        console.error("Error uploading to cloudinary:", uploadError);
-        return res.status(500).json({
-          success: false,
-          message: "Failed to upload file to cloudinary",
-          error: uploadError.message,
-        });
-      }
-    }
-
-    const updatedPost = await prisma.post.update({
-      where: { id: parseInt(id) },
-      data: updateData,
-      include: {
-        user: {
-          select: {
-            id: true,
-            nama_lengkap: true,
-            email: true,
-            image_profile_url: true,
-          },
-        },
-      },
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Post updated successfully",
-      data: updatedPost,
-    });
-  } catch (error) {
-    console.error("Error updating post:", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-      error: error.message,
-    });
-  }
-};
-
 // Delete Post
 const deletePost = async (req, res) => {
   try {
@@ -386,6 +327,9 @@ const deletePost = async (req, res) => {
 
     const existingPost = await prisma.post.findUnique({
       where: { id: parseInt(id) },
+      include: {
+        images: true,
+      },
     });
 
     if (!existingPost) {
@@ -403,19 +347,42 @@ const deletePost = async (req, res) => {
       });
     }
 
-    // Hapus file dari cloudinary jika ada
-    if (existingPost.image_content_url) {
-      try {
-        const publicId = extractPublicId(existingPost.image_content_url);
-        await cloudinary.uploader.destroy(publicId);
-      } catch (deleteError) {
-        console.error("Error deleting file from cloudinary:", deleteError);
+    // Hapus dengan transaction untuk memastikan consistency
+    await prisma.$transaction(async (tx) => {
+      // Hapus PostImage records terlebih dahulu
+      if (existingPost.images.length > 0) {
+        await tx.postImage.deleteMany({
+          where: { postId: parseInt(id) },
+        });
       }
-    }
 
-    await prisma.post.delete({
-      where: { id: parseInt(id) },
+      // Kemudian hapus Post
+      await tx.post.delete({
+        where: { id: parseInt(id) },
+      });
     });
+
+    // Hapus files dari cloudinary setelah database berhasil dihapus
+    if (existingPost.images.length > 0) {
+      const deletePromises = existingPost.images.map(async (image) => {
+        try {
+          // Gunakan cloudinaryId jika ada, jika tidak fallback ke extract dari URL
+          const publicId =
+            image.cloudinaryId || extractPublicId(image.imageUrl);
+          if (publicId) {
+            await cloudinary.uploader.destroy(publicId);
+            console.log(
+              `Successfully deleted image from cloudinary: ${publicId}`
+            );
+          }
+        } catch (deleteError) {
+          console.error("Error deleting file from cloudinary:", deleteError);
+        }
+      });
+
+      // Tunggu semua file terhapus (atau error)
+      await Promise.allSettled(deletePromises);
+    }
 
     res.status(200).json({
       success: true,
@@ -458,6 +425,5 @@ module.exports = {
   createPost,
   getAllPosts,
   getPostById,
-  updatePost,
   deletePost,
 };
