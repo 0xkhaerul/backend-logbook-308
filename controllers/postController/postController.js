@@ -2,6 +2,7 @@ const { prisma } = require("../../config/db");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 const jwt = require("jsonwebtoken");
+const sharp = require("sharp"); // Tambahkan sharp untuk image processing
 
 // Helper function to get userId from token
 const getUserIdFromToken = (req) => {
@@ -57,6 +58,87 @@ const upload = multer({
   },
 });
 
+// Helper function untuk kompres dan resize gambar
+const compressImage = async (buffer, mimetype, filename) => {
+  try {
+    // Hanya proses jika file adalah gambar
+    if (!mimetype.startsWith("image/")) {
+      return { buffer, mimetype, filename };
+    }
+
+    // Skip compression untuk GIF (animated images)
+    if (mimetype === "image/gif") {
+      return { buffer, mimetype, filename };
+    }
+
+    // Konfigurasi kompresi berdasarkan ukuran file
+    const originalSize = buffer.length;
+    let quality = 85;
+    let maxWidth = 1920;
+    let maxHeight = 1080;
+
+    // Adjust quality based on file size
+    if (originalSize > 5 * 1024 * 1024) {
+      // > 5MB
+      quality = 70;
+      maxWidth = 1600;
+      maxHeight = 900;
+    } else if (originalSize > 2 * 1024 * 1024) {
+      // > 2MB
+      quality = 75;
+      maxWidth = 1800;
+      maxHeight = 1000;
+    }
+
+    // Proses dengan Sharp
+    let sharpInstance = sharp(buffer).resize(maxWidth, maxHeight, {
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+
+    // Set format dan quality berdasarkan tipe file
+    if (mimetype === "image/png") {
+      sharpInstance = sharpInstance.png({
+        quality: quality,
+        compressionLevel: 8,
+      });
+    } else {
+      // Convert to JPEG for better compression
+      sharpInstance = sharpInstance.jpeg({
+        quality: quality,
+        progressive: true,
+        mozjpeg: true,
+      });
+      mimetype = "image/jpeg";
+      filename = filename.replace(/\.(png|webp)$/i, ".jpg");
+    }
+
+    const compressedBuffer = await sharpInstance.toBuffer();
+
+    // Log compression results
+    const compressionRatio = (
+      ((originalSize - compressedBuffer.length) / originalSize) *
+      100
+    ).toFixed(2);
+    console.log(`Image compressed: ${filename}`);
+    console.log(`Original size: ${(originalSize / 1024 / 1024).toFixed(2)}MB`);
+    console.log(
+      `Compressed size: ${(compressedBuffer.length / 1024 / 1024).toFixed(2)}MB`
+    );
+    console.log(`Compression ratio: ${compressionRatio}%`);
+
+    return {
+      buffer: compressedBuffer,
+      mimetype: mimetype,
+      filename: filename,
+    };
+  } catch (error) {
+    console.error("Error compressing image:", error);
+    // Return original if compression fails
+    return { buffer, mimetype, filename };
+  }
+};
+
 // Helper function untuk upload ke Cloudinary
 const uploadToCloudinary = (buffer, mimetype, filename) => {
   return new Promise((resolve, reject) => {
@@ -88,6 +170,13 @@ const uploadToCloudinary = (buffer, mimetype, filename) => {
         "avi",
         "webm",
       ],
+      // Tambahan optimisasi untuk Cloudinary
+      transformation: [
+        {
+          quality: "auto:good",
+          fetch_format: "auto",
+        },
+      ],
     };
 
     cloudinary.uploader
@@ -102,21 +191,66 @@ const uploadToCloudinary = (buffer, mimetype, filename) => {
   });
 };
 
-// Helper function untuk upload multiple files
+// Helper function untuk upload multiple files dengan kompresi
 const uploadMultipleFiles = async (files) => {
-  const uploadPromises = files.map((file) =>
-    uploadToCloudinary(file.buffer, file.mimetype, file.originalname)
-  );
-
   try {
+    // Step 1: Compress all images
+    console.log(`Starting compression for ${files.length} files...`);
+    const compressionPromises = files.map((file) =>
+      compressImage(file.buffer, file.mimetype, file.originalname)
+    );
+
+    const compressedFiles = await Promise.all(compressionPromises);
+
+    // Step 2: Upload compressed files to Cloudinary
+    console.log("Starting upload to Cloudinary...");
+    const uploadPromises = compressedFiles.map((file) =>
+      uploadToCloudinary(file.buffer, file.mimetype, file.filename)
+    );
+
     const results = await Promise.all(uploadPromises);
+    console.log(`Successfully uploaded ${results.length} files to Cloudinary`);
+
     return results;
   } catch (error) {
+    console.error("Error in uploadMultipleFiles:", error);
     throw error;
   }
 };
 
-// Create Post dengan Multiple Images
+// Batch processing untuk file besar
+const uploadFilesInBatches = async (files, batchSize = 3) => {
+  const results = [];
+
+  for (let i = 0; i < files.length; i += batchSize) {
+    const batch = files.slice(i, i + batchSize);
+    console.log(
+      `Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(
+        files.length / batchSize
+      )}`
+    );
+
+    try {
+      const batchResults = await uploadMultipleFiles(batch);
+      results.push(...batchResults);
+
+      // Small delay between batches to avoid overwhelming the server
+      if (i + batchSize < files.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    } catch (error) {
+      console.error(
+        `Error processing batch ${Math.floor(i / batchSize) + 1}:`,
+        error
+      );
+      throw error;
+    }
+  }
+
+  return results;
+};
+
+// Create Post dengan Multiple Images dan Kompresi
 const createPost = async (req, res) => {
   let uploadedFiles = [];
 
@@ -144,10 +278,25 @@ const createPost = async (req, res) => {
       });
     }
 
-    // Upload files jika ada
+    // Upload files jika ada dengan batch processing
     if (req.files && req.files.length > 0) {
       try {
-        uploadedFiles = await uploadMultipleFiles(req.files);
+        console.log(`Processing ${req.files.length} files...`);
+
+        // Calculate total size before processing
+        const totalSize = req.files.reduce((sum, file) => sum + file.size, 0);
+        console.log(
+          `Total file size: ${(totalSize / 1024 / 1024).toFixed(2)}MB`
+        );
+
+        // Use batch processing for files > 6 or total size > 20MB
+        if (req.files.length > 6 || totalSize > 20 * 1024 * 1024) {
+          uploadedFiles = await uploadFilesInBatches(req.files, 3);
+        } else {
+          uploadedFiles = await uploadMultipleFiles(req.files);
+        }
+
+        console.log(`Successfully processed all ${uploadedFiles.length} files`);
       } catch (uploadError) {
         console.error("Error uploading to cloudinary:", uploadError);
         return res.status(500).json({
@@ -172,7 +321,7 @@ const createPost = async (req, res) => {
       if (uploadedFiles.length > 0) {
         const imageData = uploadedFiles.map((file) => ({
           imageUrl: file.secure_url,
-          cloudinaryId: file.public_id, // Tambahkan cloudinary public_id
+          cloudinaryId: file.public_id,
           postId: post.id,
         }));
 
@@ -202,12 +351,17 @@ const createPost = async (req, res) => {
       success: true,
       message: "Post created successfully",
       data: newPost,
+      uploadInfo: {
+        totalFiles: uploadedFiles.length,
+        processedFiles: uploadedFiles.length,
+      },
     });
   } catch (error) {
     console.error("Error creating post:", error);
 
     // Hapus files dari cloudinary jika ada error database
     if (uploadedFiles.length > 0) {
+      console.log("Cleaning up uploaded files due to error...");
       const deletePromises = uploadedFiles.map((file) =>
         cloudinary.uploader
           .destroy(file.public_id)
